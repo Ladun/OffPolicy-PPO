@@ -12,4 +12,4 @@ python main.py --config=configs/Ant-v4.yaml
 
 # Result
 
-![](https://github.com/Ladun/OffPolicy-PPO/blob/master/plots/plots.jpg)
+![](https://github.com/Ladun/OffPolicy-PPO/blob/master/plots/plot.jpg)
