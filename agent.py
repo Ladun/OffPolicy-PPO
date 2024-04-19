@@ -421,43 +421,46 @@ class PPOAgent:
                 
                 # ------------- Uniform sampling -------------
                 
-                with self.timer_manager.get_timer("\tuniform sampling"):
-                    data, inds  = self.memory.uniform_sample(int(self.config.env.num_envs * (1 - fraction)), (self.old_policy, self.critic))
-                    data        = self.prepare_data(data)
+                if 1 - fraction > 0:
+                    with self.timer_manager.get_timer("\tuniform sampling"):
+                        data, inds  = self.memory.uniform_sample(int(self.config.env.num_envs * (1 - fraction)), (self.old_policy, self.critic))
+                        data        = self.prepare_data(data)
+                        
+                        data_loader     = data_iterator(self.config.train.ppo.batch_size, data)                    
+                        v_loss          = self.optimize_critic(data_loader)
+                        avg_value_loss += v_loss   
+                        if self.config.train.off_policy_buffer_size > 0:
+                            self.memory.update_priority((self.old_policy, self.critic), inds)
+                        
+                        data_loader        = data_iterator(self.config.train.ppo.batch_size, data)
+                        p_loss, e_loss     = self.optimize_actor(data_loader)  
+                        avg_policy_loss   += p_loss
+                        avg_entropy_loss  += e_loss                  
                     
-                    data_loader     = data_iterator(self.config.train.ppo.batch_size, data)                    
-                    v_loss          = self.optimize_critic(data_loader)
-                    avg_value_loss += v_loss   
-                    self.memory.update_priority((self.old_policy, self.critic), inds)
                     
-                    data_loader        = data_iterator(self.config.train.ppo.batch_size, data)
-                    p_loss, e_loss     = self.optimize_actor(data_loader)  
-                    avg_policy_loss   += p_loss
-                    avg_entropy_loss  += e_loss                  
+                if fraction > 0:
+                    # ------------- Critic prioritized sampling -------------
+                                        
+                    with self.timer_manager.get_timer("\tcritic prioritized sampling"):
+                        data, inds  = self.memory.priority_sample(int(self.config.env.num_envs * fraction), (self.old_policy, self.critic))
+                        data        = self.prepare_data(data)
+                        
+                        data_loader     = data_iterator(self.config.train.ppo.batch_size, data)
+                        v_loss          = self.optimize_critic(data_loader)
+                        avg_value_loss += v_loss
+                        self.memory.update_priority((self.old_policy, self.critic), inds)
+                        
+                    # ------------- Actor inverse prioritized sampling -------------
                     
-                    
-                # ------------- Critic prioritized sampling -------------
-                                    
-                with self.timer_manager.get_timer("\tcritic prioritized sampling"):
-                    data, inds  = self.memory.priority_sample(int(self.config.env.num_envs * fraction), (self.old_policy, self.critic))
-                    data        = self.prepare_data(data)
-                    
-                    data_loader     = data_iterator(self.config.train.ppo.batch_size, data)
-                    v_loss          = self.optimize_critic(data_loader)
-                    avg_value_loss += v_loss
-                    self.memory.update_priority((self.old_policy, self.critic), inds)
-                    
-                # ------------- Actor inverse prioritized sampling -------------
-                
-                with self.timer_manager.get_timer("\tactor prioritized sampling"):
-                    data, _  = self.memory.priority_sample(int(self.config.env.num_envs * fraction), (self.old_policy, self.critic), inverse=True)
-                    data     = self.prepare_data(data)
-                    
-                    data_loader        = data_iterator(self.config.train.ppo.batch_size, data)
-                    p_loss, e_loss     = self.optimize_actor(data_loader)  
-                    avg_policy_loss   += p_loss
-                    avg_entropy_loss  += e_loss      
-                    
+                    with self.timer_manager.get_timer("\tactor prioritized sampling"):
+                        data, _  = self.memory.priority_sample(int(self.config.env.num_envs * fraction), (self.old_policy, self.critic), inverse=True)
+                        data     = self.prepare_data(data)
+                        
+                        data_loader        = data_iterator(self.config.train.ppo.batch_size, data)
+                        p_loss, e_loss     = self.optimize_actor(data_loader)  
+                        avg_policy_loss   += p_loss
+                        avg_entropy_loss  += e_loss
+                        
                 # ------------- Recording -------------
                 
                 avg_policy_loss /= 2
