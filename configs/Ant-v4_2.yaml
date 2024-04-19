@@ -36,3 +36,4 @@ train:
     max_ckpt_count: 3
     advantage_type: 'vtrace_gae'
     off_policy_buffer_size: 300
+    fraction: 0.5

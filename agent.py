@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 
 from replay_buffer import PPOMemory
-from model import ActorCritic
+from model import Actor, Critic
 from scheduler import WarmupLinearSchedule
 from utils.general import (
     set_seed, get_rng_state, set_rng_state,
@@ -29,6 +29,21 @@ from utils.stuff import RewardScaler, ObservationNormalizer
 
 
 logger = logging.getLogger(__name__)
+
+
+            
+def data_iterator(batch_size, given_data, t=False):
+    # Simple mini-batch spliter
+
+    ob, ac, oldpas, adv, tdlamret, old_v = given_data
+    total_size = len(ob)
+    indices = np.arange(total_size)
+    np.random.shuffle(indices)
+    n_batches = total_size // batch_size
+    for nb in range(n_batches):
+        ind = indices[batch_size * nb : batch_size * (nb + 1)]
+        yield ob[ind], ac[ind], oldpas[ind], adv[ind], tdlamret[ind], old_v[ind]      
+
 
 class PPOAgent:
     def __init__(self, config):
@@ -41,18 +56,27 @@ class PPOAgent:
         self.env_rng_state = rng_state
         
         # -------- Define models --------
-        self.network     = ActorCritic(config, self.device).to(self.device)
-        self.old_network = ActorCritic(config, self.device).to(self.device)
+        self.policy     = Actor(config, self.device).to(self.device)
+        self.old_policy = Actor(config, self.device).to(self.device)
         
-        self.optimizer   = torch.optim.Adam(
-            self.network.parameters(),
+        self.critic     = Critic(config, self.device).to(self.device)
+        
+        self.policy_optimizer = torch.optim.Adam(
+            self.policy.parameters(),
+            **self.config.network.optimizer
+        )
+        self.critic_optimizer = torch.optim.Adam(
+            self.critic.parameters(),
             **self.config.network.optimizer
         )
 
         if self.config.train.scheduler:
-            self.scheduler = WarmupLinearSchedule(optimizer=self.optimizer,
-                                                  warmup_steps=0,
-                                                  max_steps=self.config.train.total_timesteps // (self.config.train.max_episode_len * self.config.env.num_envs))
+            self.scheduler1 = WarmupLinearSchedule(optimizer=self.policy_optimizer,
+                                                   warmup_steps=0,
+                                                   max_steps=self.config.train.total_timesteps // (self.config.train.max_episode_len * self.config.env.num_envs))
+            self.scheduler2 = WarmupLinearSchedule(optimizer=self.critic_optimizer,
+                                                   warmup_steps=0,
+                                                   max_steps=self.config.train.total_timesteps // (self.config.train.max_episode_len * self.config.env.num_envs))
             
         # [EXPERIMENT] - reward scaler: r / rs.std()
         if self.config.train.reward_scaler:
@@ -108,10 +132,13 @@ class PPOAgent:
         os.makedirs(ckpt_path, exist_ok=True)
         
         # save model and optimizers
-        torch.save(self.network.state_dict(), os.path.join(ckpt_path, "network.pt"))
-        torch.save(self.optimizer.state_dict(), os.path.join(ckpt_path, "optimizer.pt"))
+        torch.save(self.policy.state_dict(), os.path.join(ckpt_path, "policy.pt"))
+        torch.save(self.critic.state_dict(), os.path.join(ckpt_path, "critic.pt"))
+        torch.save(self.policy_optimizer.state_dict(), os.path.join(ckpt_path, "policy_optimizer.pt"))
+        torch.save(self.critic_optimizer.state_dict(), os.path.join(ckpt_path, "critic_optimizer.pt"))
         if self.config.train.scheduler:
-            torch.save(self.scheduler.state_dict(), os.path.join(ckpt_path, "scheduler.pt"))
+            torch.save(self.scheduler1.state_dict(), os.path.join(ckpt_path, "scheduler1.pt"))
+            torch.save(self.scheduler2.state_dict(), os.path.join(ckpt_path, "scheduler2.pt"))
 
         # save random state
         torch.save(get_rng_state(), os.path.join(ckpt_path, 'rng_state.ckpt'))
@@ -133,10 +160,13 @@ class PPOAgent:
         ckpt_path = os.path.join(experiment_path, "checkpoints", postfix)
         print(f"Load pretrained model from {ckpt_path}")
 
-        ppo_algo.network.load_state_dict(torch.load(os.path.join(ckpt_path, "network.pt")))
-        ppo_algo.optimizer.load_state_dict(torch.load(os.path.join(ckpt_path, "optimizer.pt")))
+        ppo_algo.policy.load_state_dict(torch.load(os.path.join(ckpt_path, "policy.pt")))
+        ppo_algo.critic.load_state_dict(torch.load(os.path.join(ckpt_path, "critic.pt")))
+        ppo_algo.policy_optimizer.load_state_dict(torch.load(os.path.join(ckpt_path, "policy_optimizer.pt")))
+        ppo_algo.critic_optimizer.load_state_dict(torch.load(os.path.join(ckpt_path, "critic_optimizer.pt")))
         if ppo_algo.config.train.scheduler:
-            ppo_algo.scheduler.load_state_dict(torch.load(os.path.join(ckpt_path, "scheduler.pt")))
+            ppo_algo.scheduler1.load_state_dict(torch.load(os.path.join(ckpt_path, "scheduler1.pt")))
+            ppo_algo.scheduler2.load_state_dict(torch.load(os.path.join(ckpt_path, "scheduler2.pt")))
 
         # load random state
         set_rng_state(torch.load(os.path.join(ckpt_path, 'rng_state.ckpt'), map_location='cpu'))
@@ -223,6 +253,7 @@ class PPOAgent:
         
         print(f"================ Start training ================")
         print(f"========= Exp name: {self.config.experiment_name} ==========")
+        self.policy.eval()
         while self.timesteps < self.config.train.total_timesteps:
 
             with self.timer_manager.get_timer("Total"):
@@ -247,8 +278,11 @@ class PPOAgent:
                         with torch.no_grad():
                             if self.config.train.observation_normalizer:
                                 state = self.obs_normalizer(state)
-                            action, logprobs, _, values = self.network(torch.from_numpy(state).to(self.device, dtype=torch.float))
+                            _state = torch.from_numpy(state).to(self.device, dtype=torch.float)
+                            action, logprobs, _ = self.policy(_state)
+                            values = self.critic(_state)
                             values = values.flatten() # reshape shape of the value to (num_envs,)
+                            
                         next_state, reward, terminated, truncated, _ = envs.step(np.clip(action.cpu().numpy(), envs.action_space.low, envs.action_space.high))
                         self.timesteps += self.config.env.num_envs
 
@@ -287,7 +321,7 @@ class PPOAgent:
                 with torch.no_grad():
                     if self.config.train.observation_normalizer:
                         next_state = self.obs_normalizer(next_state)
-                    _, _, _, next_value = self.network(torch.Tensor(next_state).to(self.device))
+                    next_value = self.critic(torch.Tensor(next_state).to(self.device))                    
                     next_value = next_value.flatten()
 
                 # update gae & tdlamret
@@ -299,14 +333,15 @@ class PPOAgent:
                 if self.config.env.is_continuous:
                     while self.timesteps > next_action_std_decay_step:
                         next_action_std_decay_step +=  self.config.network.action_std_decay_freq
-                        self.network.action_decay(
+                        self.policy.action_decay(
                             self.config.network.action_std_decay_rate,
                             self.config.network.min_action_std
                         )
 
                 # scheduling learning rate
                 if self.config.train.scheduler:
-                    self.scheduler.step()
+                    self.scheduler1.step()
+                    self.scheduler2.step()
 
             # ------------- Logging training state -------------
 
@@ -318,8 +353,11 @@ class PPOAgent:
             self.writer.add_scalar("train/score", avg_score, self.timesteps)
             self.writer.add_scalar("train/duration", avg_duration, self.timesteps)
             if self.config.train.scheduler:
-                for idx, lr in enumerate(self.scheduler.get_lr()):
+                # TODO: Clean up your code 
+                for idx, lr in enumerate(self.scheduler1.get_lr()):
                     self.writer.add_scalar(f"train/learning_rate{idx}", lr, self.timesteps)
+                for idx, lr in enumerate(self.scheduler2.get_lr()):
+                    self.writer.add_scalar(f"train/learning_rate{idx + 1}", lr, self.timesteps)
 
             # Printing for console
             remaining_num_of_optimize = int(math.ceil((self.config.train.total_timesteps - self.timesteps) /
@@ -357,140 +395,184 @@ class PPOAgent:
         return s, a, logp, adv, v_target, v   
 
     def copy_network_param(self):
-        self.old_network.load_state_dict(self.network.state_dict())
-        self.old_network.set_action_std(self.network.action_std)  
+        self.old_policy.load_state_dict(self.policy.state_dict())
+        self.old_policy.set_action_std(self.policy.action_std)  
     
 
     def optimize(self, next_state, next_value, done):
         
         self.copy_network_param()
         
-        with self.timer_manager.get_timer("\tprepare_data"):
-            self.memory.finish(next_state, next_value, done)
-            data = self.memory.get_data(self.config.env.num_envs, self.old_network)
-            data = self.prepare_data(data)
+                    
+        self.memory.finish(next_state, next_value, done)
+                    
 
+        fraction = self.config.train.fraction
         with self.timer_manager.get_timer("\toptimize_ppo"):
-            self.optimize_ppo(data)  
-              
+            
+            # -------- PPO Training Loop --------
+                
+            self.policy.train()         
+            for _ in range(self.config.train.ppo.optim_epochs):
+                   
+                avg_policy_loss = 0
+                avg_entropy_loss = 0
+                avg_value_loss = 0
+                
+                # ------------- Uniform sampling -------------
+                
+                with self.timer_manager.get_timer("\tuniform sampling"):
+                    data, inds  = self.memory.uniform_sample(int(self.config.env.num_envs * (1 - fraction)), (self.old_policy, self.critic))
+                    data        = self.prepare_data(data)
+                    
+                    data_loader     = data_iterator(self.config.train.ppo.batch_size, data)                    
+                    v_loss          = self.optimize_critic(data_loader)
+                    avg_value_loss += v_loss   
+                    self.memory.update_priority((self.old_policy, self.critic), inds)
+                    
+                    data_loader        = data_iterator(self.config.train.ppo.batch_size, data)
+                    p_loss, e_loss     = self.optimize_actor(data_loader)  
+                    avg_policy_loss   += p_loss
+                    avg_entropy_loss  += e_loss                  
+                    
+                    
+                # ------------- Critic prioritized sampling -------------
+                                    
+                with self.timer_manager.get_timer("\tcritic prioritized sampling"):
+                    data, inds  = self.memory.priority_sample(int(self.config.env.num_envs * fraction), (self.old_policy, self.critic))
+                    data        = self.prepare_data(data)
+                    
+                    data_loader     = data_iterator(self.config.train.ppo.batch_size, data)
+                    v_loss          = self.optimize_critic(data_loader)
+                    avg_value_loss += v_loss
+                    self.memory.update_priority((self.old_policy, self.critic), inds)
+                    
+                # ------------- Actor inverse prioritized sampling -------------
+                
+                with self.timer_manager.get_timer("\tactor prioritized sampling"):
+                    data, _  = self.memory.priority_sample(int(self.config.env.num_envs * fraction), (self.old_policy, self.critic), inverse=True)
+                    data     = self.prepare_data(data)
+                    
+                    data_loader        = data_iterator(self.config.train.ppo.batch_size, data)
+                    p_loss, e_loss     = self.optimize_actor(data_loader)  
+                    avg_policy_loss   += p_loss
+                    avg_entropy_loss  += e_loss      
+                    
+                # ------------- Recording -------------
+                
+                avg_policy_loss /= 2
+                avg_entropy_loss /= 2
+                avg_value_loss /= 2
+                    
+                self.writer.add_scalar("train/policy_loss", avg_policy_loss, self.trained_epoch)
+                self.writer.add_scalar("train/entropy_loss", avg_entropy_loss, self.trained_epoch)
+                self.writer.add_scalar("train/value_loss", avg_value_loss, self.trained_epoch)
+                self.writer.add_scalar("train/total_loss", avg_policy_loss + avg_entropy_loss + avg_value_loss, self.trained_epoch)                 
 
-    def optimize_ppo(self, data):
+                self.trained_epoch += 1
+                    
+    def optimize_actor(self, data_loader):
 
-        def ppo_iter(batch_size, given_data):
-            # Simple mini-batch spliter
+        policy_losses   = []
+        entropy_losses  = []
+        
+        c2 = self.config.train.ppo.coef_entropy_penalty
+        for batch in data_loader:
+            bev_ob, bev_ac, bev_logp, bev_adv, _, _ = batch
+            bev_adv = (bev_adv - bev_adv.mean()) / (bev_adv.std() + 1e-7)
 
-            ob, ac, oldpas, adv, tdlamret, old_v = given_data
-            total_size = len(ob)
-            indices = np.arange(total_size)
-            np.random.shuffle(indices)
-            n_batches = total_size // batch_size
-            for nb in range(n_batches):
-                ind = indices[batch_size * nb : batch_size * (nb + 1)]
-                yield ob[ind], ac[ind], oldpas[ind], adv[ind], tdlamret[ind], old_v[ind]
+            _, cur_logp, cur_ent = self.policy(bev_ob, action=bev_ac)
 
+            with torch.no_grad():
+                _, old_logp, _ = self.old_policy(bev_ob, action=bev_ac)
 
-        # -------- PPO Training Loop --------
+            # -------- Policy Loss --------
 
-        self.network.train()
-        for _ in range(self.config.train.ppo.optim_epochs):
-            data_loader = ppo_iter(self.config.train.ppo.batch_size, data)
+            # ratio = pi(x|s) / mu(x|s)
+            ratio   = torch.exp(cur_logp - bev_logp)
 
-            # -------- Initialize --------
+            # loss  = ratio * advantage
+            surr1   = ratio * bev_adv
 
-            policy_losses   = []
-            entropy_losses  = []
-            value_losses    = []
-            total_losses    = []
+            if self.config.train.ppo.loss_type == "clip":
+                # clipped loss
+                lower           = (1 - self.config.train.ppo.eps_clip) * torch.exp(old_logp - bev_logp)
+                upper           = (1 + self.config.train.ppo.eps_clip) * torch.exp(old_logp - bev_logp)
+                clipped_ratio   = torch.clamp(ratio, lower, upper)
 
-            with self.timer_manager.get_timer("\t\tone_epoch"):
-                for batch in data_loader:
-                    bev_ob, bev_ac, bev_logp, bev_adv, bev_vtarg, bev_v = batch
-                    bev_adv = (bev_adv - bev_adv.mean()) / (bev_adv.std() + 1e-7)
+                surr2       = clipped_ratio * bev_adv
+                policy_surr = torch.min(surr1, surr2)
 
-                    _, cur_logp, cur_ent, cur_v = self.network(bev_ob, action=bev_ac)
-                    cur_v = cur_v.reshape(-1)
+            elif self.config.train.ppo.loss_type == "kl":
+                # kl-divergence loss
+                policy_surr = surr1 - 0.01 * torch.exp(bev_logp) * (bev_logp - cur_logp)
+            else:
+                # simple ratio loss
+                policy_surr = surr1
 
-                    with torch.no_grad():
-                        _, old_logp, _, _ = self.old_network(bev_ob, action=bev_ac)
+            # policy loss
+            policy_surr = -policy_surr.mean()
 
-                    # -------- Policy Loss --------
+            # entropy loss
+            policy_ent  = -cur_ent.mean()
+            
+            self.policy_optimizer.zero_grad()
+            policy_loss = policy_surr + c2 * policy_ent
+            policy_loss.backward()
+            if self.config.train.clipping_gradient:
+                nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=0.5)
+            self.policy_optimizer.step()
 
-                    # ratio = pi(x|s) / mu(x|s)
-                    ratio   = torch.exp(cur_logp - bev_logp)
+            # ---------- For recoding training loss data ----------
 
-                    # loss  = ratio * advantage
-                    surr1   = ratio * bev_adv
+            policy_losses.append(policy_surr.item())
+            entropy_losses.append(policy_ent.item())
+            
+        return np.mean(policy_losses), np.mean(entropy_losses)
 
-                    if self.config.train.ppo.loss_type == "clip":
-                        # clipped loss
-                        lower           = (1 - self.config.train.ppo.eps_clip) * torch.exp(old_logp - bev_logp)
-                        upper           = (1 + self.config.train.ppo.eps_clip) * torch.exp(old_logp - bev_logp)
-                        clipped_ratio   = torch.clamp(ratio, lower, upper)
+    def optimize_critic(self, data_loader):
 
-                        surr2       = clipped_ratio * bev_adv
-                        policy_surr = torch.min(surr1, surr2)
+        value_losses    = []
+        
+        c1 = self.config.train.ppo.coef_value_function
 
-                    elif self.config.train.ppo.loss_type == "kl":
-                        # kl-divergence loss
-                        policy_surr = surr1 - 0.01 * torch.exp(bev_logp) * (bev_logp - cur_logp)
-                    else:
-                        # simple ratio loss
-                        policy_surr = surr1
+        for batch in data_loader:
+            bev_ob, _, _, _, bev_vtarg, bev_v = batch
 
-                    # policy loss
-                    policy_surr = -policy_surr.mean()
+            cur_v = self.critic(bev_ob)
+            cur_v = cur_v.reshape(-1)
+            
+            # --------------- Value Loss ---------------
 
-                    # entropy loss
-                    policy_ent  = -cur_ent.mean()
+            if self.config.train.ppo.value_clipping:
+                cur_v_clipped = bev_v + torch.clamp(
+                    cur_v - bev_v,
+                    -self.config.train.ppo.eps_clip,
+                    self.config.train.ppo.eps_clip
+                )
 
-                    # --------------- Value Loss ---------------
+                vloss1  = (cur_v - bev_vtarg) ** 2
+                vloss2  = (cur_v_clipped - bev_vtarg) ** 2
+                vf_loss = torch.max(vloss1, vloss2)
+            else:
+                vf_loss = (cur_v - bev_vtarg) ** 2
 
-                    if self.config.train.ppo.value_clipping:
-                        cur_v_clipped = bev_v + torch.clamp(
-                            cur_v - bev_v,
-                            -self.config.train.ppo.eps_clip,
-                            self.config.train.ppo.eps_clip
-                        )
+            vf_loss = 0.5 * vf_loss.mean()
+            
 
-                        vloss1  = (cur_v - bev_vtarg) ** 2
-                        vloss2  = (cur_v_clipped - bev_vtarg) ** 2
-                        vf_loss = torch.max(vloss1, vloss2)
-                    else:
-                        vf_loss = (cur_v - bev_vtarg) ** 2
+            self.critic_optimizer.zero_grad()
+            critic_loss = c1 * vf_loss
+            critic_loss.backward()
+            if self.config.train.clipping_gradient:
+                nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=0.5)
+            self.critic_optimizer.step()
+            
+            # ---------- For recording training loss data ----------
+            
+            value_losses.append(vf_loss.item())
 
-                    vf_loss = 0.5 * vf_loss.mean()
+        return np.mean(value_losses)
 
-                    # -------- Policy backward process --------
-
-                    c1 = self.config.train.ppo.coef_value_function
-                    c2 = self.config.train.ppo.coef_entropy_penalty
-
-                    total_loss = policy_surr + c2 * policy_ent + c1 * vf_loss
-
-                    self.optimizer.zero_grad()
-                    total_loss.backward()
-                    if self.config.train.clipping_gradient:
-                        nn.utils.clip_grad_norm_(self.network.parameters(), max_norm=0.5)
-                    self.optimizer.step()
-
-                    # ---------- Record training loss data ----------
-
-                    policy_losses.append(policy_surr.item())
-                    entropy_losses.append(policy_ent.item())
-                    value_losses.append(vf_loss.item())
-                    total_losses.append(total_loss.item())
-
-            avg_policy_loss = np.mean(policy_losses)
-            avg_entropy_loss = np.mean(entropy_losses)
-            avg_value_loss = np.mean(value_losses)
-            avg_total_loss = np.mean(total_losses)
-
-            self.writer.add_scalar("train/policy_loss", avg_policy_loss, self.trained_epoch)
-            self.writer.add_scalar("train/entropy_loss", avg_entropy_loss, self.trained_epoch)
-            self.writer.add_scalar("train/value_loss", avg_value_loss, self.trained_epoch)
-            self.writer.add_scalar("train/total_loss", avg_total_loss, self.trained_epoch)                 
-
-            self.trained_epoch += 1
 
     
     def play(self, env, max_ep_len, num_episodes=10):  

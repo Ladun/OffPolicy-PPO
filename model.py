@@ -49,7 +49,7 @@ def orthogonal_init(tensor, gain=1):
     return tensor
 
 
-class ActorCritic(nn.Module):
+class Critic(nn.Module):
     def __init__(self, config, device):
         super().__init__()
 
@@ -57,44 +57,46 @@ class ActorCritic(nn.Module):
 
         self.is_cont    = config.env.is_continuous
         self.device     = device
-        self.shared_layer = config.network.shared_layer
+        
+        self.m = nn.Sequential(
+            nn.Linear(config.env.state_dim, 64),
+            nn.Tanh(),
+            nn.Linear(64, 64),
+            nn.Tanh(),
+            nn.Linear(64, 1)
+        )          
+        
+        self.apply(init_orthogonal_weights)
+
+    def forward(self, state):
+
+        return self.m(state)
+    
+
+
+class Actor(nn.Module):
+    def __init__(self, config, device):
+        super().__init__()
+
+        # -------- Initialize variables --------
+
+        self.is_cont    = config.env.is_continuous
+        self.device     = device
 
         if self.is_cont:
             # if action space is defined as continuous, make variance
             self.action_dim = config.env.action_dim
             self.action_std = config.network.action_std_init
             self.action_var = torch.full((self.action_dim, ), config.network.action_std_init ** 2).to(self.device)
-            # self.actor_logstd = nn.Parameter(torch.log(torch.ones(1, config.env.action_dim)))
-
-        if self.shared_layer:
-            self.shared_net = nn.Sequential(
-                nn.Linear(config.env.state_dim, 64),
-                nn.Tanh(),
-                nn.Linear(64, 64),
-                nn.Tanh()
-            )
-            self.actor = nn.Sequential(
-                nn.Linear(64, config.env.action_dim),
-                nn.Tanh()
-            )
-            self.critic = nn.Linear(64, 1)
-
-        else:
-            self.actor = nn.Sequential(
-                nn.Linear(config.env.state_dim, 64),
-                nn.Tanh(),
-                nn.Linear(64, 64),
-                nn.Tanh(),
-                nn.Linear(64, config.env.action_dim),
-                nn.Tanh()
-            )
-            self.critic = nn.Sequential(
-                nn.Linear(config.env.state_dim, 64),
-                nn.Tanh(),
-                nn.Linear(64, 64),
-                nn.Tanh(),
-                nn.Linear(64, 1)
-            )          
+            
+        self.m = nn.Sequential(
+            nn.Linear(config.env.state_dim, 64),
+            nn.Tanh(),
+            nn.Linear(64, 64),
+            nn.Tanh(),
+            nn.Linear(64, config.env.action_dim),
+            nn.Tanh()
+        )
         
         self.apply(init_orthogonal_weights)
 
@@ -115,38 +117,23 @@ class ActorCritic(nn.Module):
         self.action_std = action_std
         self.action_var = torch.full((self.action_dim, ), self.action_std ** 2).to(self.device)
 
-    def get_value(self, state):
-        if self.shared_layer:
-            state = self.shared_net(state)
-
-        return self.critic(state)
-
-
     def forward(self, state, action=None):
-        if self.shared_layer:
-            state = self.shared_net(state)
 
         if self.is_cont:
             # continuous space action 
-            action_mean = self.actor(state)
+            action_mean = self.m(state)
 
             action_var = self.action_var.expand_as(action_mean)
             cov_mat = torch.diag_embed(action_var).to(self.device)
             dist = MultivariateNormal(action_mean, cov_mat)
-
-            # action_logstd = self.actor_logstd.expand_as(action_mean)
-            # action_std = torch.exp(action_logstd)
-            # cov_mat = torch.diag_embed(action_std)
-            # dist = MultivariateNormal(action_mean, cov_mat)
-
         else:
             # discrete space action
-            action_probs = self.actor(state)
+            action_probs = self.m(state)
             dist = Categorical(action_probs)
 
         # Get (action, action's log probs, estimated Value)
         if action is None:
             action = dist.sample()
 
-        return action, dist.log_prob(action), dist.entropy(), self.critic(state)
+        return action, dist.log_prob(action), dist.entropy()
 
