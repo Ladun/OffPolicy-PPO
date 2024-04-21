@@ -57,10 +57,11 @@ class PPOAgent:
         
         # -------- Define models --------
         self.policy     = Actor(config, self.device).to(self.device)
-        self.old_policy = Actor(config, self.device).to(self.device)
-        
         self.critic     = Critic(config, self.device).to(self.device)
-        
+
+        self.old_policy = Actor(config, self.device).to(self.device)
+        self.old_critic = Critic(config, self.device).to(self.device)
+                
         self.policy_optimizer = torch.optim.Adam(
             self.policy.parameters(),
             **self.config.network.optimizer
@@ -353,7 +354,7 @@ class PPOAgent:
             self.writer.add_scalar("train/score", avg_score, self.timesteps)
             self.writer.add_scalar("train/duration", avg_duration, self.timesteps)
             if self.config.train.scheduler:
-                # TODO: Clean up your code 
+                # TODO: Clean up my code 
                 for idx, lr in enumerate(self.scheduler1.get_lr()):
                     self.writer.add_scalar(f"train/learning_rate{idx}", lr, self.timesteps)
                 for idx, lr in enumerate(self.scheduler2.get_lr()):
@@ -397,6 +398,8 @@ class PPOAgent:
     def copy_network_param(self):
         self.old_policy.load_state_dict(self.policy.state_dict())
         self.old_policy.set_action_std(self.policy.action_std)  
+
+        self.old_critic.load_state_dict(self.critic.state_dict())
     
 
     def optimize(self, next_state, next_value, done):
@@ -407,7 +410,6 @@ class PPOAgent:
         self.memory.finish(next_state, next_value, done)
                     
 
-        fraction = self.config.train.fraction
         with self.timer_manager.get_timer("\toptimize_ppo"):
             
             # -------- PPO Training Loop --------
@@ -418,19 +420,18 @@ class PPOAgent:
                 avg_policy_loss = 0
                 avg_entropy_loss = 0
                 avg_value_loss = 0
-                
                 # ------------- Uniform sampling -------------
                 
                 if 1 - fraction > 0:
-                    with self.timer_manager.get_timer("\tuniform sampling"):
-                        data, inds  = self.memory.uniform_sample(int(self.config.env.num_envs * (1 - fraction)), (self.old_policy, self.critic))
+                    with self.timer_manager.get_timer("\toptimize with uniform sampling"):
+                        data, inds  = self.memory.uniform_sample(int(self.config.env.num_envs * (1 - fraction)), (self.old_policy, self.old_critic))
                         data        = self.prepare_data(data)
                         
                         data_loader     = data_iterator(self.config.train.ppo.batch_size, data)                    
                         v_loss          = self.optimize_critic(data_loader)
                         avg_value_loss += v_loss   
-                        if self.config.train.off_policy_buffer_size > 0:
-                            self.memory.update_priority((self.old_policy, self.critic), inds)
+                        if not warmup and self.config.train.off_policy_buffer_size > 0:
+                            self.memory.update_priority((self.old_policy, self.old_critic), inds)
                         
                         data_loader        = data_iterator(self.config.train.ppo.batch_size, data)
                         p_loss, e_loss     = self.optimize_actor(data_loader)  
@@ -441,8 +442,8 @@ class PPOAgent:
                 if fraction > 0:
                     # ------------- Critic prioritized sampling -------------
                                         
-                    with self.timer_manager.get_timer("\tcritic prioritized sampling"):
-                        data, inds  = self.memory.priority_sample(int(self.config.env.num_envs * fraction), (self.old_policy, self.critic))
+                    with self.timer_manager.get_timer("\toptimize with critic prioritized sampling"):
+                        data, inds  = self.memory.priority_sample(int(self.config.env.num_envs * fraction), (self.old_policy, self.old_critic))
                         data        = self.prepare_data(data)
                         
                         data_loader     = data_iterator(self.config.train.ppo.batch_size, data)
@@ -452,8 +453,8 @@ class PPOAgent:
                         
                     # ------------- Actor inverse prioritized sampling -------------
                     
-                    with self.timer_manager.get_timer("\tactor prioritized sampling"):
-                        data, _  = self.memory.priority_sample(int(self.config.env.num_envs * fraction), (self.old_policy, self.critic), inverse=True)
+                    with self.timer_manager.get_timer("\toptimize with actor prioritized sampling"):
+                        data, _  = self.memory.priority_sample(int(self.config.env.num_envs * fraction), (self.old_policy, self.old_critic), inverse=True)
                         data     = self.prepare_data(data)
                         
                         data_loader        = data_iterator(self.config.train.ppo.batch_size, data)
@@ -463,9 +464,10 @@ class PPOAgent:
                         
                 # ------------- Recording -------------
                 
-                avg_policy_loss /= 2
-                avg_entropy_loss /= 2
-                avg_value_loss /= 2
+                optimize_cnt = (fraction > 0) + ((1 - fraction) > 0)
+                avg_policy_loss /= optimize_cnt
+                avg_entropy_loss /= optimize_cnt
+                avg_value_loss /= optimize_cnt
                     
                 self.writer.add_scalar("train/policy_loss", avg_policy_loss, self.trained_epoch)
                 self.writer.add_scalar("train/entropy_loss", avg_entropy_loss, self.trained_epoch)
