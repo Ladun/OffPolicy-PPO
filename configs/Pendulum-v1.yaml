@@ -1,35 +1,35 @@
-device: "cuda"
+device: "cpu"
 seed: 77
 env:
-    env_name: "Ant-v4"
-    num_envs: 30
+    env_name: "InvertedPendulum-v4"
+    num_envs: 8
     is_continuous: True
-    state_dim: 27
-    action_dim: 8
-checkpoint_path: "checkpoints/Ant"
+    state_dim: 4
+    action_dim: 1
+checkpoint_path: "checkpoints/InvertedPendulum"
 network:
     action_std_init: 0.4
-    action_std_decay_rate: 0.01
+    action_std_decay_rate: 0.03
     min_action_std: 0.1
-    action_std_decay_freq: 3e5
+    action_std_decay_freq: 1e5
     shared_layer: False
     optimizer:
         lr: 3e-4
 train: 
-    total_timesteps: 10000000
+    total_timesteps: 1000000
     max_episode_len: 1024
     gamma: 0.99
     tau: 0.95
     ppo:
         loss_type: clip
         optim_epochs: 10
-        batch_size: 960    
+        batch_size: 256    
         eps_clip: 0.2
         coef_value_function: 0.5
         coef_entropy_penalty: 0
         value_clipping: True
     reward_scaler: True
-    observation_normalizer: True
+    observation_normalizer: False
     clipping_gradient: True
     scheduler: True
     average_interval: 100
